@@ -324,11 +324,29 @@ export const methods: { [key: string]: (...any: any) => any } = {
     },
 
     /**
-     * Create prefab from node
+     * Create a prefab asset from a scene node using the editor-native prefab
+     * manager (cce.Prefab.createPrefabAssetFromNode). This is the same path the
+     * editor uses when a node is dragged into the Assets panel, so custom-script
+     * components are serialized by their script asset UUID (no cc.MissingScript)
+     * and @property references + spriteFrame wiring are preserved.
+     *
+     * @param nodeUuid  UUID of the source node in the current scene.
+     * @param prefabUrl Target asset url, e.g. db://assets/prefabs/LetterCell.prefab
      */
-    createPrefabFromNode(nodeUuid: string, prefabPath: string) {
+    async createPrefabFromNode(nodeUuid: string, prefabUrl: string) {
         try {
-            const { director, instantiate } = require('cc');
+            // `cce` is the scene-process global injected by the editor. Prefer it
+            // over any hand-rolled serializer because the engine emits a fully
+            // valid prefab (script UUID, fileIds, overrides) for us.
+            const cce: any = (globalThis as any).cce;
+            if (!cce || !cce.Prefab || typeof cce.Prefab.createPrefabAssetFromNode !== 'function') {
+                return {
+                    success: false,
+                    error: 'cce.Prefab.createPrefabAssetFromNode is not available in this scene process'
+                };
+            }
+
+            const { director } = require('cc');
             const scene = director.getScene();
             if (!scene) {
                 return { success: false, error: 'No active scene' };
@@ -339,18 +357,108 @@ export const methods: { [key: string]: (...any: any) => any } = {
                 return { success: false, error: `Node with UUID ${nodeUuid} not found` };
             }
 
-            // 注意：这里只是一个模拟实现，因为运行时环境下无法直接创建预制体文件
-            // 真正的预制体创建需要Editor API支持
+            // createPrefabAssetFromNode(nodeUUID, url) -> resolves to the new
+            // prefab asset uuid (or null/undefined on failure). It also links the
+            // source node to the new prefab as a prefab instance.
+            const resultUuid = await cce.Prefab.createPrefabAssetFromNode(nodeUuid, prefabUrl);
+            if (!resultUuid) {
+                return {
+                    success: false,
+                    error: `createPrefabAssetFromNode returned no uuid for node ${nodeUuid} -> ${prefabUrl}`
+                };
+            }
+
             return {
                 success: true,
                 data: {
-                    prefabPath: prefabPath,
+                    prefabUuid: resultUuid,
+                    prefabPath: prefabUrl,
                     sourceNodeUuid: nodeUuid,
-                    message: `Prefab created from node '${node.name}' at ${prefabPath}`
+                    message: `Prefab created from node '${node.name}' at ${prefabUrl} (native editor serializer)`
                 }
             };
         } catch (error: any) {
-            return { success: false, error: error.message };
+            return { success: false, error: error.message || String(error) };
+        }
+    },
+
+    /**
+     * Resolve a component's compressed class id (cid) from a human-readable
+     * class name on a specific node. Returns the cid the editor's set-property /
+     * query-node APIs expect. Custom script components are addressed by cid, not
+     * by class name, so this lets callers pass either.
+     *
+     * @param nodeUuid     UUID of the node to inspect.
+     * @param componentType Either a human class name (e.g. "LetterCellView") or
+     *                      an already-compressed cid (returned as-is if present).
+     */
+    resolveComponentCid(nodeUuid: string, componentType: string) {
+        try {
+            const cc = require('cc');
+            const { director, js } = cc;
+            const scene = director.getScene();
+            if (!scene) {
+                return { success: false, error: 'No active scene' };
+            }
+            const node = scene.getChildByUuid(nodeUuid);
+            if (!node) {
+                return { success: false, error: `Node with UUID ${nodeUuid} not found` };
+            }
+
+            const getCid = (ctor: any): string | null => {
+                if (!ctor) return null;
+                // js._getClassId returns the registered class id (cid for scripts,
+                // 'cc.X' for engine components).
+                try {
+                    if (typeof js._getClassId === 'function') {
+                        return js._getClassId(ctor, false) || null;
+                    }
+                } catch { /* ignore */ }
+                return ctor.__cid__ || null;
+            };
+
+            const components = node.components.map((comp: any) => {
+                const ctor = comp.constructor;
+                return {
+                    name: ctor ? ctor.name : 'Unknown',
+                    cid: getCid(ctor),
+                    uuid: comp.uuid
+                };
+            });
+
+            // 1. Exact match by human class name.
+            let match = components.find((c: any) => c.name === componentType);
+            // 2. Match by cid (already a cid / engine type string).
+            if (!match) {
+                match = components.find((c: any) => c.cid === componentType);
+            }
+            // 3. Engine type passed as class name with cc. prefix etc.
+            if (!match) {
+                const ComponentClass = js.getClassByName(componentType);
+                if (ComponentClass) {
+                    const wanted = getCid(ComponentClass);
+                    match = components.find((c: any) => c.cid === wanted);
+                }
+            }
+
+            if (!match) {
+                return {
+                    success: false,
+                    error: `No component matching '${componentType}' on node`,
+                    data: { available: components }
+                };
+            }
+
+            return {
+                success: true,
+                data: {
+                    cid: match.cid,
+                    name: match.name,
+                    available: components
+                }
+            };
+        } catch (error: any) {
+            return { success: false, error: error.message || String(error) };
         }
     },
 

@@ -778,6 +778,19 @@ export class PrefabTools implements ToolExecutor {
                 const includeChildren = args.includeChildren !== false; // 默认为 true
                 const includeComponents = args.includeComponents !== false; // 默认为 true
 
+                // Preferred path: editor-native prefab creation via the scene
+                // process (cce.Prefab.createPrefabAssetFromNode). This serializes
+                // custom-script components by their script asset UUID, so the
+                // resulting prefab instantiates as a real component (no
+                // cc.MissingScript) with @property refs + spriteFrame preserved.
+                console.log('Trying editor-native prefab creation (scene script)...');
+                const nativeSceneResult = await this.createPrefabViaSceneScript(args.nodeUuid, fullPath);
+                if (nativeSceneResult.success) {
+                    resolve(nativeSceneResult);
+                    return;
+                }
+                console.warn('Editor-native prefab creation unavailable, falling back to asset-db serializer:', nativeSceneResult.error);
+
                 // 优先使用新的 asset-db 方法创建预制体
                 console.log('使用新的 asset-db 方法创建预制体...');
                 const assetDbResult = await this.createPrefabWithAssetDB(
@@ -813,6 +826,57 @@ export class PrefabTools implements ToolExecutor {
                 });
             }
         });
+    }
+
+    /**
+     * Create a prefab using the editor-native serializer that runs in the scene
+     * process (cce.Prefab.createPrefabAssetFromNode), exposed through our
+     * registered `createPrefabFromNode` scene script method. This is the only
+     * path that correctly serializes custom-script components by their script
+     * asset UUID, so the prefab instantiates without cc.MissingScript and keeps
+     * @property references + spriteFrame wiring intact.
+     */
+    private async createPrefabViaSceneScript(nodeUuid: string, prefabPath: string): Promise<ToolResponse> {
+        try {
+            if (!nodeUuid) {
+                return { success: false, error: 'nodeUuid is required for native prefab creation' };
+            }
+
+            const options = {
+                name: 'cocos-mcp-server',
+                method: 'createPrefabFromNode',
+                args: [nodeUuid, prefabPath]
+            };
+
+            const result: any = await Editor.Message.request('scene', 'execute-scene-script', options);
+
+            if (result && result.success) {
+                // Make sure the asset database picks up the new file.
+                try {
+                    await Editor.Message.request('asset-db', 'refresh-asset', prefabPath);
+                } catch (refreshErr) {
+                    console.warn('refresh-asset after native prefab creation failed (non-fatal):', refreshErr);
+                }
+
+                return {
+                    success: true,
+                    data: {
+                        prefabPath: prefabPath,
+                        nodeUuid: nodeUuid,
+                        prefabUuid: result.data?.prefabUuid,
+                        method: 'editor-native (cce.Prefab.createPrefabAssetFromNode)',
+                        message: result.data?.message || 'Prefab created via editor-native serializer'
+                    }
+                };
+            }
+
+            return {
+                success: false,
+                error: (result && result.error) || 'Scene script createPrefabFromNode returned no success'
+            };
+        } catch (error: any) {
+            return { success: false, error: `Native prefab creation failed: ${error.message || error}` };
+        }
     }
 
     private async createPrefabNative(nodeUuid: string, prefabPath: string): Promise<ToolResponse> {

@@ -64,6 +64,42 @@ export class ProjectTools implements ToolExecutor {
                 }
             },
             {
+                name: 'set_design_resolution',
+                description: 'Set the project design resolution (general.designResolution). Use for portrait layouts, e.g. width=720 height=1280. fitWidth/fitHeight control the Canvas fit policy.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        width: {
+                            type: 'number',
+                            description: 'Design resolution width in pixels (e.g. 720)'
+                        },
+                        height: {
+                            type: 'number',
+                            description: 'Design resolution height in pixels (e.g. 1280)'
+                        },
+                        fitWidth: {
+                            type: 'boolean',
+                            description: 'Fit Width policy. Default false.',
+                            default: false
+                        },
+                        fitHeight: {
+                            type: 'boolean',
+                            description: 'Fit Height policy. Default true (recommended for portrait).',
+                            default: true
+                        }
+                    },
+                    required: ['width', 'height']
+                }
+            },
+            {
+                name: 'start_preview',
+                description: 'Open the editor preview (Project > Preview) and return the preview URL. NOTE: runtime/browser console logs from the running game are NOT capturable via MCP; open the returned URL in a browser to see them.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {}
+                }
+            },
+            {
                 name: 'refresh_assets',
                 description: 'Refresh asset database',
                 inputSchema: {
@@ -401,6 +437,10 @@ export class ProjectTools implements ToolExecutor {
                 return await this.getProjectInfo();
             case 'get_project_settings':
                 return await this.getProjectSettings(args.category);
+            case 'set_design_resolution':
+                return await this.setDesignResolution(args);
+            case 'start_preview':
+                return await this.startPreview();
             case 'refresh_assets':
                 return await this.refreshAssets(args.folder);
             case 'import_asset':
@@ -447,23 +487,19 @@ export class ProjectTools implements ToolExecutor {
     }
 
     private async runProject(platform: string = 'browser'): Promise<ToolResponse> {
-        return new Promise((resolve) => {
-            const previewConfig = {
-                platform: platform,
-                scenes: [] // Will use current scene
+        // run_project now opens the real editor preview (Project > Preview) and
+        // returns the preview URL, instead of opening the build panel.
+        // Runtime console logs still require opening the URL in a browser; they
+        // are not capturable via MCP.
+        const result = await this.startPreview();
+        if (result.success) {
+            return {
+                success: true,
+                message: `Preview opened for platform '${platform}'.`,
+                data: result.data
             };
-
-            // Note: Preview module is not documented in official API
-            // Using fallback approach - open build panel as alternative
-            Editor.Message.request('builder', 'open').then(() => {
-                resolve({
-                    success: true,
-                    message: `Build panel opened. Preview functionality requires manual setup.`
-                });
-            }).catch((err: Error) => {
-                resolve({ success: false, error: err.message });
-            });
-        });
+        }
+        return result;
     }
 
     private async buildProject(args: any): Promise<ToolResponse> {
@@ -540,6 +576,99 @@ export class ProjectTools implements ToolExecutor {
                 resolve({ success: false, error: err.message });
             });
         });
+    }
+
+    private async setDesignResolution(args: any): Promise<ToolResponse> {
+        const width = Number(args.width);
+        const height = Number(args.height);
+        if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+            return {
+                success: false,
+                error: `Invalid design resolution. width and height must be positive numbers. Received width=${args.width}, height=${args.height}.`
+            };
+        }
+        const fitWidth = args.fitWidth === true;
+        // Default fitHeight to true (portrait-friendly) unless explicitly false.
+        const fitHeight = args.fitHeight === undefined ? true : args.fitHeight === true;
+
+        try {
+            // Read existing designResolution so we preserve any extra fields.
+            let current: any = {};
+            try {
+                current = await Editor.Message.request('project', 'query-config', 'project', 'general.designResolution') || {};
+            } catch {
+                current = {};
+            }
+
+            const designResolution = {
+                ...current,
+                width,
+                height,
+                fitWidth,
+                fitHeight
+            };
+
+            // set-config(configName, path, value) -> boolean
+            const ok = await Editor.Message.request(
+                'project',
+                'set-config',
+                'project',
+                'general.designResolution',
+                designResolution
+            );
+
+            if (ok === false) {
+                return {
+                    success: false,
+                    error: 'Editor rejected set-config for general.designResolution',
+                    data: { attempted: designResolution }
+                };
+            }
+
+            // Read it back for confirmation.
+            let applied: any = designResolution;
+            try {
+                applied = await Editor.Message.request('project', 'query-config', 'project', 'general.designResolution') || designResolution;
+            } catch { /* keep attempted */ }
+
+            return {
+                success: true,
+                message: `Design resolution set to ${width}x${height} (fitWidth=${fitWidth}, fitHeight=${fitHeight})`,
+                data: { designResolution: applied }
+            };
+        } catch (err: any) {
+            return { success: false, error: `Failed to set design resolution: ${err.message || err}` };
+        }
+    }
+
+    private async startPreview(): Promise<ToolResponse> {
+        try {
+            // Open the preview panel (Project > Preview). This is the real editor
+            // preview entry point.
+            await Editor.Message.request('preview', 'open');
+
+            // Try to fetch the preview URL so the caller can open it in a browser.
+            let previewUrl: string | undefined;
+            try {
+                previewUrl = await Editor.Message.request('preview', 'query-preview-url');
+            } catch { /* url query is best-effort */ }
+
+            return {
+                success: true,
+                message: 'Preview opened (Project > Preview).',
+                data: {
+                    previewUrl: previewUrl || null,
+                    note: 'Runtime/browser console logs from the running game are NOT capturable via MCP. ' +
+                        'Open the previewUrl in a browser to observe runtime logs (e.g. BrowserAdapter init, scene load).'
+                }
+            };
+        } catch (err: any) {
+            return {
+                success: false,
+                error: `Failed to open preview: ${err.message || err}`,
+                instruction: 'Open the preview manually in the editor: Project > Preview (or the Play button).'
+            };
+        }
     }
 
     private async refreshAssets(folder?: string): Promise<ToolResponse> {

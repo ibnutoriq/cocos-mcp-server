@@ -151,7 +151,8 @@
                 "setComponentProperty",
                 "getCurrentSceneInfo",
                 "getSceneHierarchy",
-                "createPrefabFromNode"
+                "createPrefabFromNode",
+                "resolveComponentCid"
             ]
         }
     }

@@ -288,28 +288,35 @@ export class ComponentTools implements ToolExecutor {
                 resolve({ success: false, error: `Failed to get components for node '${nodeUuid}': ${allComponentsInfo.error}` });
                 return;
             }
-            // 2. 只查找type字段等于componentType的组件（即cid）
-            const exists = allComponentsInfo.data.components.some((comp: any) => comp.type === componentType);
-            if (!exists) {
-                resolve({ success: false, error: `Component cid '${componentType}' not found on node '${nodeUuid}'. 请用getComponents获取type字段（cid）作为componentType。` });
+            // 2. Resolve componentType: accept either a cid (the `type` from
+            //    get_components) or a human script/class name.
+            const availableTypes: string[] = allComponentsInfo.data.components.map((c: any) => c.type);
+            const resolvedType = await this.resolveComponentType(nodeUuid, componentType, availableTypes);
+            if (!resolvedType || !availableTypes.includes(resolvedType)) {
+                resolve({
+                    success: false,
+                    error: `Component '${componentType}' not found on node '${nodeUuid}'. ` +
+                        `Pass the component's class id (cid) or its script class name. ` +
+                        `Available cids: ${availableTypes.join(', ')}. Use get_components to list each component's 'type' (cid).`
+                });
                 return;
             }
             // 3. 官方API直接移除
             try {
                 await Editor.Message.request('scene', 'remove-component', {
                     uuid: nodeUuid,
-                    component: componentType
+                    component: resolvedType
                 });
                 // 4. 再查一次确认是否移除
                 const afterRemoveInfo = await this.getComponents(nodeUuid);
-                const stillExists = afterRemoveInfo.success && afterRemoveInfo.data?.components?.some((comp: any) => comp.type === componentType);
+                const stillExists = afterRemoveInfo.success && afterRemoveInfo.data?.components?.some((comp: any) => comp.type === resolvedType);
                 if (stillExists) {
-                    resolve({ success: false, error: `Component cid '${componentType}' was not removed from node '${nodeUuid}'.` });
+                    resolve({ success: false, error: `Component '${componentType}' (cid '${resolvedType}') was not removed from node '${nodeUuid}'.` });
                 } else {
                     resolve({
                         success: true,
-                        message: `Component cid '${componentType}' removed successfully from node '${nodeUuid}'`,
-                        data: { nodeUuid, componentType }
+                        message: `Component '${componentType}' (cid '${resolvedType}') removed successfully from node '${nodeUuid}'`,
+                        data: { nodeUuid, componentType, resolvedComponentType: resolvedType }
                     });
                 }
             } catch (err: any) {
@@ -367,13 +374,20 @@ export class ComponentTools implements ToolExecutor {
     private async getComponentInfo(nodeUuid: string, componentType: string): Promise<ToolResponse> {
         return new Promise((resolve) => {
             // 优先尝试直接使用 Editor API 查询节点信息
-            Editor.Message.request('scene', 'query-node', nodeUuid).then((nodeData: any) => {
+            Editor.Message.request('scene', 'query-node', nodeUuid).then(async (nodeData: any) => {
                 if (nodeData && nodeData.__comps__) {
-                    const component = nodeData.__comps__.find((comp: any) => {
-                        const compType = comp.__type__ || comp.cid || comp.type;
-                        return compType === componentType;
-                    });
-                    
+                    const typeOf = (comp: any) => comp.__type__ || comp.cid || comp.type;
+                    let component = nodeData.__comps__.find((comp: any) => typeOf(comp) === componentType);
+
+                    // Fall back to class-name -> cid resolution if the direct match failed.
+                    if (!component) {
+                        const availableTypes: string[] = nodeData.__comps__.map((c: any) => typeOf(c));
+                        const resolvedType = await this.resolveComponentType(nodeUuid, componentType, availableTypes);
+                        if (resolvedType) {
+                            component = nodeData.__comps__.find((comp: any) => typeOf(comp) === resolvedType);
+                        }
+                    }
+
                     if (component) {
                         resolve({
                             success: true,
@@ -499,6 +513,45 @@ export class ComponentTools implements ToolExecutor {
         }
     }
 
+    /**
+     * Resolve a caller-supplied componentType (which may be a human class name
+     * such as "LetterCellView" OR an already-compressed class id/cid) to the
+     * value that query-node / set-property expect (i.e. the value that appears as
+     * `type` in get_components output). Returns null if it cannot be resolved.
+     *
+     * @param nodeUuid       node to inspect
+     * @param componentType  class name or cid
+     * @param availableTypes the `type` values already read from get_components
+     */
+    private async resolveComponentType(nodeUuid: string, componentType: string, availableTypes: string[]): Promise<string | null> {
+        // Fast path: it already matches a value get_components returned (cid or
+        // engine type like "cc.UITransform").
+        if (availableTypes.includes(componentType)) {
+            return componentType;
+        }
+
+        // Slow path: ask the scene process to map a human class name -> cid.
+        try {
+            const options = {
+                name: 'cocos-mcp-server',
+                method: 'resolveComponentCid',
+                args: [nodeUuid, componentType]
+            };
+            const result: any = await Editor.Message.request('scene', 'execute-scene-script', options);
+            if (result && result.success && result.data?.cid) {
+                // Only accept it if the resolved cid is actually on this node.
+                if (availableTypes.includes(result.data.cid)) {
+                    return result.data.cid;
+                }
+                return result.data.cid;
+            }
+        } catch (err) {
+            console.warn('[resolveComponentType] scene-script resolution failed:', err);
+        }
+
+        return null;
+    }
+
     private async setComponentProperty(args: any): Promise<ToolResponse> {
                         const { nodeUuid, componentType, property, propertyType, value } = args;
         
@@ -525,31 +578,36 @@ export class ComponentTools implements ToolExecutor {
                 }
                 
                 const allComponents = componentsResponse.data.components;
-                
+
                 // Step 2: 查找目标组件
+                // componentType may be a cid (e.g. "71d55rWvj9B8aSIwxmckg8R") OR a
+                // human class name (e.g. "LetterCellView"). Resolve it to the value
+                // get_components reports as `type` (the cid for scripts).
+                const availableTypes: string[] = allComponents.map((c: any) => c.type);
+                const resolvedType = await this.resolveComponentType(nodeUuid, componentType, availableTypes);
+
                 let targetComponent = null;
-                const availableTypes: string[] = [];
-                
-                for (let i = 0; i < allComponents.length; i++) {
-                    const comp = allComponents[i];
-                    availableTypes.push(comp.type);
-                    
-                    if (comp.type === componentType) {
-                        targetComponent = comp;
-                        break;
-                    }
+                if (resolvedType) {
+                    targetComponent = allComponents.find((comp: any) => comp.type === resolvedType) || null;
                 }
-                
+
                 if (!targetComponent) {
-                    // 提供更详细的错误信息和建议
+                    // Provide an actionable, English-only error.
                     const instruction = this.generateComponentSuggestion(componentType, availableTypes, property);
                     resolve({
                         success: false,
-                        error: `Component '${componentType}' not found on node. Available components: ${availableTypes.join(', ')}`,
+                        error: `Component '${componentType}' not found on node. ` +
+                            `Pass either the component's class id (cid) or its script class name. ` +
+                            `Available component cids on this node: ${availableTypes.join(', ')}. ` +
+                            `Use get_components to list each component's 'type' (cid).`,
                         instruction: instruction
                     });
                     return;
                 }
+
+                // From here on, use the resolved cid so set-property targets the
+                // correct component even when a class name was supplied.
+                const effectiveComponentType: string = resolvedType as string;
                 
                 // Step 3: 自动检测和转换属性值
                 let propertyInfo;
@@ -627,16 +685,41 @@ export class ComponentTools implements ToolExecutor {
                             throw new Error('Vec3 value must be an object with x, y, z properties');
                         }
                         break;
-                    case 'size':
-                        if (typeof value === 'object' && value !== null) {
-                            processedValue = {
-                                width: Number(value.width) || 0,
-                                height: Number(value.height) || 0
-                            };
+                    case 'size': {
+                        // Accept: { width, height } | { x, y } | a JSON string of either.
+                        // Coerce numeric strings ("54") to numbers. Be tolerant so a
+                        // valid {width,height} never throws.
+                        let sizeObj: any = value;
+                        if (typeof sizeObj === 'string') {
+                            try {
+                                sizeObj = JSON.parse(sizeObj);
+                            } catch {
+                                throw new Error(
+                                    `Size value must be an object like {"width":54,"height":54}. ` +
+                                    `Received the string "${value}", which is not valid JSON.`
+                                );
+                            }
+                        }
+                        if (sizeObj && typeof sizeObj === 'object') {
+                            const rawW = sizeObj.width !== undefined ? sizeObj.width : sizeObj.x;
+                            const rawH = sizeObj.height !== undefined ? sizeObj.height : sizeObj.y;
+                            const width = Number(rawW);
+                            const height = Number(rawH);
+                            if (!Number.isFinite(width) || !Number.isFinite(height)) {
+                                throw new Error(
+                                    `Size value must contain numeric width and height (or x and y). ` +
+                                    `Received ${JSON.stringify(value)}.`
+                                );
+                            }
+                            processedValue = { width, height };
                         } else {
-                            throw new Error('Size value must be an object with width, height properties');
+                            throw new Error(
+                                `Size value must be an object with width and height properties, e.g. {"width":54,"height":54}. ` +
+                                `Received ${JSON.stringify(value)}.`
+                            );
                         }
                         break;
+                    }
                     case 'node':
                         if (typeof value === 'string') {
                             processedValue = { uuid: value };
@@ -732,7 +815,7 @@ export class ComponentTools implements ToolExecutor {
                 for (let i = 0; i < rawNodeData.__comps__.length; i++) {
                     const comp = rawNodeData.__comps__[i] as any;
                     const compType = comp.__type__ || comp.cid || comp.type || 'Unknown';
-                    if (compType === componentType) {
+                    if (compType === effectiveComponentType) {
                         rawComponentIndex = i;
                         break;
                     }
@@ -783,10 +866,17 @@ export class ComponentTools implements ToolExecutor {
                         }
                     });
                 } else if (componentType === 'cc.UITransform' && (property === '_contentSize' || property === 'contentSize')) {
-                    // Special handling for UITransform contentSize - set width and height separately
-                    const width = Number(value.width) || 100;
-                    const height = Number(value.height) || 100;
-                    
+                    // Special handling for UITransform contentSize - set width and height separately.
+                    // Prefer the normalized processedValue (handles {width,height}, {x,y},
+                    // numeric strings, and JSON-string inputs from the size case above).
+                    const sizeSource = (processedValue && typeof processedValue === 'object')
+                        ? processedValue
+                        : (value || {});
+                    const wRaw = sizeSource.width !== undefined ? sizeSource.width : sizeSource.x;
+                    const hRaw = sizeSource.height !== undefined ? sizeSource.height : sizeSource.y;
+                    const width = Number.isFinite(Number(wRaw)) ? Number(wRaw) : 100;
+                    const height = Number.isFinite(Number(hRaw)) ? Number(hRaw) : 100;
+
                     // Set width first
                     await Editor.Message.request('scene', 'set-property', {
                         uuid: nodeUuid,
@@ -904,7 +994,7 @@ export class ComponentTools implements ToolExecutor {
                     let expectedComponentType = '';
                     
                     // 获取当前组件的详细信息，包括属性元数据
-                    const currentComponentInfo = await this.getComponentInfo(nodeUuid, componentType);
+                    const currentComponentInfo = await this.getComponentInfo(nodeUuid, effectiveComponentType);
                     if (currentComponentInfo.success && currentComponentInfo.data?.properties?.[property]) {
                         const propertyMeta = currentComponentInfo.data.properties[property];
                         
@@ -1063,14 +1153,15 @@ export class ComponentTools implements ToolExecutor {
                 // Step 5: 等待Editor完成更新，然后验证设置结果
                 await new Promise(resolve => setTimeout(resolve, 200)); // 等待200ms让Editor完成更新
                 
-                const verification = await this.verifyPropertyChange(nodeUuid, componentType, property, originalValue, actualExpectedValue);
-                
+                const verification = await this.verifyPropertyChange(nodeUuid, effectiveComponentType, property, originalValue, actualExpectedValue);
+
                 resolve({
                     success: true,
                     message: `Successfully set ${componentType}.${property}`,
                     data: {
                         nodeUuid,
                         componentType,
+                        resolvedComponentType: effectiveComponentType,
                         property,
                         actualValue: verification.actualValue,
                         changeVerified: verification.verified
