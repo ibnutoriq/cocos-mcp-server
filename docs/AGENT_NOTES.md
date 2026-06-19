@@ -21,3 +21,14 @@ Practical notes for driving this extension's MCP server from an AI agent (or any
 - Panel UI templates are read from `static/template/...` **at runtime** (`readFileSync`), so editing them takes effect on panel reload — **no rebuild**.
 - Panel *logic* strings (e.g. status text, category names) live in `source/panels/default/index.ts` → compiled to `dist/panels/default/index.js`; changing those requires `npm run build` (tsc).
 - The editor's display language drives `i18n:` keys; this fork additionally translated the **hardcoded** template/panel strings to English and aliased `i18n/zh.js` to re-export `en.js`, so the panel is English regardless of editor language.
+
+## Known broken / quirky tools (verified in real use)
+
+- **`prefab_create_prefab` is broken for nodes with custom-script components.** It serializes the script by **class-name string**, not by asset UUID, so instantiating the resulting prefab yields `cc.MissingScript` and drops the `spriteFrame`, size, and `@property` wiring. The prefab file on disk is non-functional.
+  - **Workaround for a grid of identical nodes:** build ONE fully-wired master node in the scene, then `node_duplicate_node` it — duplication preserves the real component and re-targets each copy's `@property` refs to its own children correctly.
+  - **To actually produce a prefab asset:** drag the wired scene node into the Assets panel **in the editor UI** (that path serializes the script asset UUID correctly). The MCP path cannot.
+- **`component_set_component_property` with `propertyType:"size"` fails** ("Size value must be an object…"). Use `node_set_node_property` with `contentSize` instead.
+- **Custom script components must be addressed by their compressed class UUID** (e.g. `71d55rWvj9B8aSIwxmckg8R`), not the class name, in `component_set_component_property`. (`get_components` returns the usable id.)
+- **`project_start_preview_server` is not supported** ("Preview server control is not supported through MCP API"). Component `onLoad`/runtime logs only fire under a real preview — start it from the editor (**Project ▸ Preview / the Play button**); the editor console is empty until then. Use `debug_validate_scene` + hierarchy/component inspection for static verification.
+- **Design resolution is not editable via MCP** — it lives in Project Settings (`settings/v2/packages/project.json` → `general.designResolution`). Set portrait there or via the Project Settings UI.
+- **Scene save path quirk:** editing often happens in the default *untitled* scene; `scene_create_scene` may leave an empty asset, and `scene_save_scene_as` can write to `db://assets/scene.scene` instead of the intended path. Verify the saved path, and `project_move_asset` to the target if needed; reopen + re-validate from disk.
