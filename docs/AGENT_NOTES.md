@@ -35,3 +35,13 @@ Practical notes for driving this extension's MCP server from an AI agent (or any
 - **[NEW] `project_start_preview` (and `project_run_project` now reuses it)** opens the real editor preview (`Editor.Message.request('preview','open')`) and returns the preview URL (`preview` → `query-preview-url`). `run_project` no longer just opens the build panel.
   - **IMPORTANT — runtime logs are still NOT MCP-capturable.** The game's `onLoad`/runtime `console.log` lines (e.g. `[BrowserAdapter] init`, `[GameScene] loaded chain`) run in the preview's browser/WebView, not in the editor process MCP talks to. `debug_get_project_logs` / `debug_get_console_logs` return editor-process logs, not the running game's console. To observe runtime logs, open the returned `previewUrl` in a browser. Use `debug_validate_scene` + hierarchy/component inspection for static verification without a human.
 - **Scene save path quirk:** editing often happens in the default *untitled* scene; `scene_create_scene` may leave an empty asset, and `scene_save_scene_as` can write to `db://assets/scene.scene` instead of the intended path. Verify the saved path, and `project_move_asset` to the target if needed; reopen + re-validate from disk.
+
+## ⚠️ Correction (verified 2026-06-19, after a full editor restart)
+
+The two scene-worker fixes above are **NOT actually working** — corrections to the optimistic "[FIXED]/[NEW]" notes:
+
+- **`prefab_create_prefab` still yields `cc.MissingScript`.** `createPrefab` is coded to route through the scene-script `createPrefabFromNode` → `cce.Prefab.createPrefabAssetFromNode`, but in practice it **falls back to the hand-rolled serializer even after a full app restart**, so the script is still serialized by class-name. Verified by create → instantiate → `component_get_components` (got `cc.MissingScript`, `__scriptAsset.uuid: "LetterCellView"`).
+- **Class-name → cid resolution does not work.** `resolveComponentCid` returns no match (e.g. `LetterCellView`), so address custom components by their **cid** (the `type` from `get_components`).
+- Both are scene-worker (`scene.ts`) methods. Code is registered in `package.json` `scene.methods` and present in `dist/scene.js`, yet the running scene worker does not engage them — a real bug to investigate (likely the `execute-scene-script` dispatch name, or the `cce.Prefab` / `cc.js._getClassId` calls), NOT a reload problem.
+- The size setter, `project_set_design_resolution`, and `project_start_preview` DO work (main-process tools).
+- Workaround for prefabs until fixed: build the node in the scene, then drag it to the Assets panel in the editor (correct native serialization).
